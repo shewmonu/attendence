@@ -1,12 +1,10 @@
 import cv2
 import numpy as np
 from ultralytics import YOLO
-import torch
-import torchreid
 from scipy.spatial.distance import cosine
 from insightface.app import FaceAnalysis
 import psycopg2
-from datetime import datetime
+from datetime import datetime, date as _date
 from dotenv import load_dotenv
 import os
 
@@ -34,10 +32,9 @@ MODEL_PATH = "yolov8s.pt"
 DOOR_PT1 = (500, 100)
 DOOR_PT2 = (800, 650)
 
-# 🔥 TWEAKED THRESHOLDS FOR MEMORY BLENDING
-FACE_THRESHOLD = 0.4
-SIMILARITY_THRESHOLD = 0.35 # Relaxed to allow Front/Back matching
-COOLDOWN_FRAMES = 60
+FACE_THRESHOLD = 0.4        # Unchanged — anti-clone fix handles the symptom
+SIMILARITY_THRESHOLD = 0.50 # Unchanged
+COOLDOWN_FRAMES = 150       # Increased — fixes phantom exits
 
 # =========================
 # MODELS
@@ -45,23 +42,27 @@ COOLDOWN_FRAMES = 60
 print("Loading Models...")
 detector = YOLO(MODEL_PATH)
 
-reid_model = torchreid.models.build_model(
-    name='osnet_x1_0',
-    num_classes=1000,
-    pretrained=True
-).float()
-reid_model.eval()
-
 face_app = FaceAnalysis(name='buffalo_l')
 face_app.prepare(ctx_id=0, det_size=(1280, 1280))
 
 # =========================
-# LOAD EMPLOYEES
+# LOAD EMPLOYEES (RAM CACHE)
 # =========================
 cursor.execute("SELECT eid, name FROM employees")
 rows = cursor.fetchall()
 name_map = {eid: name for eid, name in rows}
 print(f"Loaded {len(name_map)} registered employees from database.")
+
+# 🔥 FIX 1: Unpack the massive byte block back into a 2D array
+cursor.execute("SELECT eid, face_embedding FROM employees WHERE face_embedding IS NOT NULL")
+face_db = {}
+for eid, emb in cursor.fetchall():
+    # .reshape(-1, 512) splits the giant byte chunk back into individual 512-number faces
+    face_db[eid] = np.frombuffer(bytes(emb), dtype=np.float32).reshape(-1, 512)
+    
+print(f"Loaded {len(face_db)} employee face galleries into memory.")
+
+current_date = _date.today()
 
 # =========================
 # MEMORY
@@ -95,16 +96,37 @@ def side_of_line(x, y):
 def full_cross(prev, curr):
     return side_of_line(*prev) * side_of_line(*curr) < 0
 
-def match_face(face_emb):
-    cursor.execute("SELECT eid, face_embedding FROM employees WHERE face_embedding IS NOT NULL")
-    for eid, emb_bytes in cursor.fetchall():
-        db_emb = np.frombuffer(emb_bytes, dtype=np.float32)
-        if cosine(face_emb, db_emb) < FACE_THRESHOLD:
-            return eid
+# 🔥 FIX 2: Check the live face against ALL 15 saved frames
+def match_face(face_emb: np.ndarray | None) -> int | None:
+    if face_emb is None:
+        return None
+        
+    best_eid = None
+    best_dist = 999.0
+    
+    # Check against EVERY person in the database
+    for eid, db_embs in face_db.items():
+        # Check against EVERY saved angle for that person
+        for db_emb in db_embs: 
+            dist = cosine(face_emb, db_emb)
+            if dist < best_dist:
+                best_dist = dist
+                best_eid = eid
+                
+    if best_dist < FACE_THRESHOLD:
+        name = name_map.get(best_eid, str(best_eid))
+        print(f"[Face Match] {name} (EID {best_eid}) dist={best_dist:.3f}")
+        return best_eid
+        
+    print(f"[Face Match] No match — best dist={best_dist:.3f} (threshold={FACE_THRESHOLD})")
     return None
 
 def match_face_to_person(faces, x1, y1, x2, y2):
     for face in faces:
+        # Ignore blurry/distant faces to prevent Identity Theft
+        if float(face.det_score) < 0.60:
+            continue
+            
         fx1, fy1, fx2, fy2 = map(int, face.bbox)
         cx = (fx1 + fx2) // 2
         cy = (fy1 + fy2) // 2
@@ -112,27 +134,6 @@ def match_face_to_person(faces, x1, y1, x2, y2):
         if x1 < cx < x2 and y1 < cy < y2:
             return face.embedding
     return None
-
-def extract_reid(person_img):
-    try:
-        img = cv2.resize(person_img, (128, 256))
-        img = img.astype(np.float32) / 255.0
-        img = np.transpose(img, (2, 0, 1))
-        
-        # REQUIRED: ImageNet Normalization for OSNet
-        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(3, 1, 1)
-        std = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(3, 1, 1)
-        img = (img - mean) / std
-        
-        img = torch.tensor(img).unsqueeze(0).float()
-
-        with torch.no_grad():
-            feat = reid_model(img).cpu().numpy().flatten()
-
-        return feat / np.linalg.norm(feat)
-    except Exception as e:
-        print(f"ReID Extraction Error: {e}")
-        return None
 
 def insert_entry(eid, current_name):
     now = datetime.now()
@@ -172,6 +173,21 @@ cv2.namedWindow("Attendance System", cv2.WINDOW_NORMAL)
 # MAIN LOOP
 # =========================
 while True:
+    # =========================
+    # DAILY RESET
+    # =========================
+    if _date.today() != current_date:
+        current_date = _date.today()
+        daily_reid_db.clear()
+        tracker_to_employee.clear()
+        last_event_frame.clear()
+        track_history.clear()
+        raw_track_history.clear()
+        label_map.clear()
+        label_counter = 0
+        entry_count = 0
+        exit_count = 0
+        print(f"[Daily Reset] New day detected — all tracking state cleared for {current_date}")
 
     ret, frame = cap.read()
     if not ret:
@@ -184,7 +200,7 @@ while True:
     results = detector.track(frame, persist=True, conf=0.3, classes=[0], verbose=False)
     faces = face_app.get(frame)
 
-    # 🔵 DEBUG FACE BOXES
+    # DEBUG FACE BOXES
     for f in faces:
         fx1, fy1, fx2, fy2 = map(int, f.bbox)
         cv2.rectangle(frame, (fx1, fy1), (fx2, fy2), (255, 0, 0), 2)
@@ -195,7 +211,7 @@ while True:
         ids = results[0].boxes.id.cpu().numpy()
 
         # ==========================================
-        # 🔥 ANTI-CLONING FIX: FIND WHO IS ON SCREEN
+        # ANTI-CLONING FIX: FIND WHO IS ON SCREEN
         # ==========================================
         visible_eids_this_frame = set()
         for tid in ids:
@@ -220,57 +236,36 @@ while True:
                 continue
 
             # =========================
-            # IDENTIFICATION LOGIC
+            # IDENTIFICATION LOGIC (FACE ONLY)
             # =========================
-            if tid not in tracker_to_employee:
-                assigned_eid = None
+            # 1. Is this person new, or currently an unidentified "Guest" (EID >= 1000)?
+            is_guest = (tid in tracker_to_employee and tracker_to_employee[tid] >= 1000)
 
-                # Attempt 1: FACE MATCH (Checks DB)
+            # 2. Keep hunting for a face EVERY frame if they are a Guest or Brand New
+            if tid not in tracker_to_employee or is_guest:
+                assigned_eid = None
+                
+                # Try to find a face match
                 face_emb = match_face_to_person(faces, x1, y1, x2, y2)
                 if face_emb is not None:
                     assigned_eid = match_face(face_emb)
-                    if assigned_eid is not None:
-                        body_emb = extract_reid(person)
-                        if body_emb is not None:
-                            daily_reid_db[assigned_eid] = body_emb
-                        visible_eids_this_frame.add(assigned_eid) 
+                    
+                    # Anti-clone check: Reject if this face matched someone already on screen
+                    if assigned_eid is not None and assigned_eid in visible_eids_this_frame:
+                        assigned_eid = None
 
-                # Attempt 2: REID FALLBACK
-                if assigned_eid is None:
-                    body_emb = extract_reid(person)
-                    if body_emb is not None:
-                        best_dist = 999
-                        best_eid = None
-
-                        for known_eid, known_body_emb in daily_reid_db.items():
-                            # Anti-Cloning Check
-                            if known_eid in visible_eids_this_frame:
-                                continue
-
-                            dist = cosine(body_emb, known_body_emb)
-                            if dist < best_dist:
-                                best_dist = dist
-                                best_eid = known_eid
-
-                        if best_eid is not None and best_dist < SIMILARITY_THRESHOLD:
-                            assigned_eid = best_eid
-                            
-                            # 🔥 MEMORY BLENDING: Learn from multiple angles!
-                            old_emb = daily_reid_db[best_eid]
-                            blended_emb = (old_emb + body_emb) / 2.0
-                            daily_reid_db[best_eid] = blended_emb / np.linalg.norm(blended_emb)
-                            
-                        else:
-                            # Create a brand new person (Guest/Stranger)
-                            new_id = 1000 + int(tid)
-                            assigned_eid = new_id
-                            daily_reid_db[new_id] = body_emb
-                        
-                        visible_eids_this_frame.add(assigned_eid) 
-
+                # 3. UPGRADE: If we found a valid employee face, assign their real ID!
                 if assigned_eid is not None:
                     tracker_to_employee[tid] = assigned_eid
+                    visible_eids_this_frame.add(assigned_eid)
                     last_event_frame.setdefault(assigned_eid, -999)
+
+            # 4. DEFAULT: If they are totally new and we STILL haven't seen a face, make them a Guest
+            if tid not in tracker_to_employee:
+                new_id = 1000 + int(tid)
+                tracker_to_employee[tid] = new_id
+                visible_eids_this_frame.add(new_id)
+                last_event_frame.setdefault(new_id, -999)
 
             # =========================
             # DISPLAY NAME RESOLUTION
@@ -281,15 +276,15 @@ while True:
             else:
                 eid = tracker_to_employee[tid]
                 
-                # Fetch registered name or generate dynamic label
                 if eid in name_map:
                     name = name_map[eid]
                 else:
                     if eid not in label_map:
                         if label_counter < 26:
-                            label_map[eid] = f"Mr {chr(65 + label_counter)}"
+                            # Name strangers "Guest" instead of "Mr"
+                            label_map[eid] = f"Guest {chr(65 + label_counter)}" 
                         else:
-                            label_map[eid] = f"Mr {label_counter + 1}"
+                            label_map[eid] = f"Guest {label_counter + 1}"
                         label_counter += 1
                     name = label_map[eid]
 
@@ -305,13 +300,14 @@ while True:
             # =========================
             # ENTRY / EXIT LOGIC
             # =========================
-            track_history.setdefault(eid, []).append((cx, cy))
-            if len(track_history[eid]) > 20:
-                track_history[eid].pop(0)
+            # Track movement by YOLO 'tid', NOT 'eid'!
+            track_history.setdefault(tid, []).append((cx, cy))
+            if len(track_history[tid]) > 20:
+                track_history[tid].pop(0)
 
-            if len(track_history[eid]) >= 2:
-                prev = track_history[eid][-2]
-                curr = track_history[eid][-1]
+            if len(track_history[tid]) >= 2:
+                prev = track_history[tid][-2]
+                curr = track_history[tid][-1]
 
                 if full_cross(prev, curr):
                     if frame_counter - last_event_frame[eid] > COOLDOWN_FRAMES:
