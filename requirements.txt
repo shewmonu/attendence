@@ -1,0 +1,14 @@
+# Core Machine Learning & Vision
+opencv-python
+ultralytics
+insightface
+onnxruntime
+easyocr
+
+# Locked Data Science Libraries (CRITICAL FOR INSIGHTFACE STABILITY)
+numpy==1.26.4
+scipy==1.13.1
+
+# Database & Environment
+psycopg2-binary
+python-dotenv
